@@ -53,6 +53,7 @@ import prep      # 输入预处理：JD 去噪 / 简历分段 / 岗位相似度�
 import privacy   # 发往模型前的本地脱敏 + 返回后还原（纯函数，不联网）
 import scoring   # 硬条件核查：模型只抽取，本地规则判定（纯本地）
 import store     # 本机 data.json 读写：公司库 / 岗位记录 / 收藏
+import auth     # 多用户：Supabase 登录 + 每人一份云端数据（没配就退回本地单用户）
 import workspace # 工作台扩展：简历/Offer/心态/能力/人脉/秋招节奏/AI助手/社招（纯本地 + SVG 图表）
 
 # --------------------------------------------------------------------------
@@ -64,7 +65,7 @@ import workspace # 工作台扩展：简历/Offer/心态/能力/人脉/秋招节
 # --------------------------------------------------------------------------
 _EXPECTED_BUILD = 20261107161500
 _RELOADED: list[str] = []   # 注意：这里不能调 st.*，set_page_config 必须是最早的 st 命令
-for _mod in (store, privacy, intel, fetch_jd, prep, scoring, funnel, extract, news):
+for _mod in (store, privacy, intel, fetch_jd, prep, scoring, funnel, extract, news, auth):
     if getattr(_mod, "BUILD", 0) != _EXPECTED_BUILD:
         importlib.reload(_mod)
         _RELOADED.append(f"{_mod.__name__}.py")
@@ -2412,6 +2413,215 @@ NAV_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
 ]
 
 
+def restore_payload(raw: bytes) -> tuple[dict | None, str]:
+    """校验上传的备份文件。能还原就返回数据，否则返回 (None, 原因)。
+
+    不信任文件内容：用户可能选错文件，备份也可能被手改过。只认结构，不做猜测。
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "这个文件不是 UTF-8 文本，可能选错了文件。"
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None, "不是有效的 JSON，可能选错了文件。"
+    if not isinstance(payload, dict):
+        return None, "格式不对：备份文件的顶层应该是一个键值对象。"
+    known = {"jobs", "companies", "interviews", "settings", "resumes", "offers"}
+    if not known & set(payload.keys()):
+        return None, "文件里找不到岗位 / 公司 / 面试这些字段，不像是本程序导出的备份。"
+    return payload, ""
+
+
+def render_backup_box() -> None:
+    """侧边栏的备份 / 恢复区。
+
+    为什么需要：Streamlit 社区云的容器文件系统是临时的，官方明确说不保证持久化 ——
+    重启、重新部署、平台迁移都会让 data.json 回到初始状态。给一个手动出口最实在：
+    录完点下载存到本机，换环境或数据被清空时上传还原。
+    """
+    current = st.session_state.get("data") or store.load()
+    blob = json.dumps(current, ensure_ascii=False, indent=1).encode("utf-8")
+    jobs = len(current.get("jobs") or [])
+    interviews = len(current.get("interviews") or [])
+
+    with st.expander("💾 备份 / 恢复", expanded=False):
+        st.caption(
+            f"当前 {len(blob) / 1024:.0f} KB · 岗位 {jobs} 条 · 面试 {interviews} 场"
+        )
+        st.download_button(
+            "⬇️ 下载备份到电脑",
+            data=blob,
+            file_name=f"jobtool-backup-{datetime.now():%Y%m%d-%H%M}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="backup_download",
+        )
+        st.caption("云端重启会清空数据，建议每天录完点一次。文件含你的记录，别传到公开仓库。")
+
+        up = st.file_uploader("⬆️ 上传备份还原", type=["json"], key="backup_restore_file")
+        if up is not None:
+            payload, why = restore_payload(up.getvalue())
+            if payload is None:
+                st.error(why)
+            else:
+                incoming = len(payload.get("jobs") or [])
+                st.warning(
+                    f"将用这份备份覆盖当前数据：备份里 {incoming} 条岗位，"
+                    f"当前 {jobs} 条。覆盖后现有的会没，建议先下载一份当前备份。"
+                )
+                if st.button("确认覆盖", key="backup_restore_go", use_container_width=True):
+                    ok, msg = store.save(payload)
+                    if ok:
+                        st.session_state["data"] = payload
+                        st.success("已还原。")
+                        st.rerun()
+                    else:
+                        st.error(f"写入失败：{msg}")
+
+
+# ==========================================================================
+# 多用户：登录门 + 按用户挂载云端数据
+# ==========================================================================
+# 没配 SUPABASE_URL / SUPABASE_ANON_KEY 时下面整段不生效，应用仍是原来那个
+# 单用户本地版（读本机 data.json）—— 改造不能把现有用法弄坏，这是底线。
+LOGIN_CSS = """
+<style>
+.login-wrap{max-width:520px;margin:2.5rem auto 1.2rem;text-align:center;}
+.login-wrap .logo{font-size:2.4rem;line-height:1;}
+.login-wrap h2{margin:.5rem 0 .3rem 0;font-size:1.5rem;}
+.login-wrap p{margin:0;opacity:.68;font-size:.88rem;line-height:1.6;}
+.login-note{margin-top:1.1rem;padding:.7rem .9rem;border-radius:.7rem;font-size:.78rem;
+  line-height:1.6;background:var(--soft);opacity:.9;}
+</style>
+"""
+
+
+def render_login_page(cfg: dict) -> None:
+    """未登录时看到的页。登录 / 注册两个标签页。"""
+    st.markdown(LOGIN_CSS, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="login-wrap"><div class="logo">🧭</div>'
+        "<h2>求职工作台</h2>"
+        "<p>登录后，岗位记录、面试真题、投递进度只有你自己能看到。<br>"
+        "同一个链接，每个人看到的是自己那一份。</p></div>",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.pop("auth_expired", False):
+        st.warning("登录状态已过期，请重新登录。")
+
+    _left, mid, _right = st.columns([1, 1.6, 1])
+    with mid:
+        tab_in, tab_up = st.tabs(["登录", "注册"])
+
+        with tab_in, st.form("login_form"):
+            email = st.text_input("邮箱", key="login_email_in", placeholder="you@example.com")
+            pwd = st.text_input("密码", type="password", key="login_pwd_in")
+            if st.form_submit_button("登录", type="primary", use_container_width=True):
+                clean = (email or "").strip().lower()
+                if not clean or not pwd:
+                    st.error("邮箱和密码都要填。")
+                else:
+                    try:
+                        session, why = auth.sign_in(cfg, clean, pwd)
+                    except auth.CloudError as exc:
+                        st.error(str(exc))
+                    else:
+                        if session:
+                            st.session_state["auth_session"] = session
+                            st.rerun()
+                        else:
+                            st.error(why or "登录失败。")
+
+        with tab_up, st.form("signup_form"):
+            email2 = st.text_input("邮箱", key="signup_email", placeholder="you@example.com")
+            pwd2 = st.text_input("密码（至少 6 位）", type="password", key="signup_pwd")
+            pwd3 = st.text_input("再输一次密码", type="password", key="signup_pwd2")
+            if st.form_submit_button("注册", type="primary", use_container_width=True):
+                clean2 = (email2 or "").strip().lower()
+                if not clean2 or not pwd2:
+                    st.error("邮箱和密码都要填。")
+                elif len(pwd2) < 6:
+                    st.error("密码至少 6 位。")
+                elif pwd2 != pwd3:
+                    st.error("两次输入的密码不一样。")
+                else:
+                    try:
+                        session, why = auth.sign_up(cfg, clean2, pwd2)
+                    except auth.CloudError as exc:
+                        st.error(str(exc))
+                    else:
+                        if session:
+                            st.session_state["auth_session"] = session
+                            st.rerun()
+                        else:
+                            st.info(why or "注册完成，去邮箱确认后登录。")
+
+        st.markdown(
+            '<div class="login-note">数据存在云端数据库，每人一行，'
+            "数据库权限策略锁死「只能读写自己那一行」，别人拿到接口地址也翻不到你的记录。<br>"
+            "录完记得在左下角「💾 备份 / 恢复」下载一份到电脑。</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def ensure_login(cfg: dict) -> dict:
+    """云模式的登录门。已登录返回会话；没登录就画登录页并停下。"""
+    session = st.session_state.get("auth_session")
+    if session and not auth.still_valid(session):
+        fresh = auth.refresh(cfg, session)
+        if fresh:
+            st.session_state["auth_session"] = session = fresh
+        else:
+            session = None
+            st.session_state.pop("auth_session", None)
+            st.session_state["auth_expired"] = True
+    if session:
+        return session
+
+    render_login_page(cfg)
+    st.stop()
+    return {}  # 走不到这里，给类型检查留个返回值
+
+
+def activate_cloud_data(cfg: dict) -> None:
+    """把 store 的读写挂到当前登录用户名下。
+
+    这里不在启动时固定一份 token：token 一小时后会过期，闭包里存死了就会在
+    「用了一小时突然存不进去」时报错。每次读写都走 _live() 现取现续。
+    """
+
+    def _live() -> dict:
+        s = st.session_state.get("auth_session")
+        if not s:
+            raise auth.CloudError("登录状态已失效，请刷新页面重新登录。")
+        if not auth.still_valid(s):
+            fresh = auth.refresh(cfg, s)
+            if not fresh:
+                raise auth.CloudError("登录已过期，请刷新页面重新登录。")
+            st.session_state["auth_session"] = fresh
+            s = fresh
+        return s
+
+    store.use_cloud_backend(
+        lambda: auth.fetch_data(cfg, _live()),
+        lambda data: auth.save_data(cfg, _live(), data),
+    )
+
+
+def render_account_box(session: dict) -> None:
+    """侧边栏的账号信息 + 退出登录。"""
+    with st.expander(f"👤 {session.get('email') or '已登录'}", expanded=False):
+        st.caption("数据存在云端数据库，只有你自己能看到。")
+        if st.button("退出登录", use_container_width=True, key="logout_go"):
+            st.session_state.pop("auth_session", None)
+            st.session_state.pop("data", None)
+            st.session_state.pop("data_user", None)
+            store.reset_cloud_backend()
+            st.rerun()
+
+
 def render_nav() -> str:
     """左侧导航窗格。
 
@@ -2440,15 +2650,22 @@ def render_nav() -> str:
                     goto(key)
 
         st.divider()
+        _acct = st.session_state.get("auth_session")
+        if _acct:
+            render_account_box(_acct)
+        render_backup_box()
         info = store.stats()
         st.caption(
             f"📦 岗位 {info.get('jobs', 0)} 条　·　真题 {info.get('interviews', 0)} 场"
         )
-        st.caption(f"数据文件：`{info.get('path', '-')}`")
+        if store.cloud_backend_active():
+            st.caption("☁️ 数据在云端，只有当前账号能看到。")
+        else:
+            st.caption(f"数据文件：`{info.get('path', '-')}`")
         mem = process_mem_mb()
         if mem:
             st.caption(f"进程内存约 {mem:.0f} MB。占内存的主要是简历解析和页面缓存，关掉浏览器会释放。")
-        if info.get("on_system_drive"):
+        if info.get("on_system_drive") and not store.cloud_backend_active():
             st.warning("数据还在 C 盘，建议到「⚙️ 求职设置」换到 D 盘。")
     return st.session_state.get("nav_page", "home")
 
@@ -6213,6 +6430,8 @@ def render_pool_page(data: dict) -> None:
     links = (
         ("前程无忧", f"https://we.51job.com/pc/search?keyword={quote(keyword)}&jobArea=000000"),
         ("BOSS直聘", f"https://www.zhipin.com/web/geek/job?query={quote(keyword)}&city=100010000"),
+        ("智联招聘", f"https://sou.zhaopin.com/?kw={quote(keyword)}"),
+        ("猎聘", f"https://www.liepin.com/zhaopin/?key={quote(keyword)}"),
         ("实习僧", f"https://www.shixiseng.com/interns?keyword={quote(keyword)}"),
     )
     st.markdown("**🔗 去招聘站找新的**")
@@ -6542,8 +6761,19 @@ if "data_checked" not in st.session_state:
     st.session_state["data_checked"] = True
     st.session_state["data_notice"] = store.migrate_if_needed()
 
-if "data" not in st.session_state:
+# ---- 多用户：配了云端就先登录，再谈数据 ----
+# 位置很关键：必须在下面 data 载入之前，因为 store.load() 在云端模式下要按登录用户去取。
+# 没配 Supabase 时 _cloud_cfg 为 None，整段跳过，行为和原来完全一致。
+_cloud_cfg = auth.config()
+_auth_session: dict | None = None
+if _cloud_cfg:
+    _auth_session = ensure_login(_cloud_cfg)
+    activate_cloud_data(_cloud_cfg)
+
+_current_uid = (_auth_session or {}).get("user_id")
+if "data" not in st.session_state or st.session_state.get("data_user") != _current_uid:
     st.session_state["data"] = store.load()
+    st.session_state["data_user"] = _current_uid
 data = st.session_state["data"]
 
 # 自定义阶段要在任何页面渲染之前套进去（填岗位、追踪、批量条都读 STAGES）

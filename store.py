@@ -254,8 +254,43 @@ def set_blob(data: dict, key: str, value) -> None:
     data["settings"][key] = value
 
 
+# --------------------------------------------------------------------------
+# 云端后端：多用户时每人一份数据
+# --------------------------------------------------------------------------
+# 为什么要做成钩子而不是把 load/save 全改写：业务代码里几十处调 store.save(data)，
+# 一个个改既容易漏、也容易在改动中弄坏原有逻辑。这里只换"数据从哪来、到哪去"，
+# 上层一行都不用动。没注册后端时行为和以前完全一致（读写本地 data.json）。
+_CLOUD_LOAD = None
+_CLOUD_SAVE = None
+
+
+def use_cloud_backend(load_fn, save_fn) -> None:
+    """把读写切到云端。load_fn() 返回 dict 或 None，save_fn(data) 返回 (bool, str)。"""
+    global _CLOUD_LOAD, _CLOUD_SAVE
+    _CLOUD_LOAD, _CLOUD_SAVE = load_fn, save_fn
+
+
+def reset_cloud_backend() -> None:
+    """退回本地文件模式。退出登录、或者测试里要恢复原状时用。"""
+    global _CLOUD_LOAD, _CLOUD_SAVE
+    _CLOUD_LOAD = _CLOUD_SAVE = None
+
+
+def cloud_backend_active() -> bool:
+    return _CLOUD_LOAD is not None
+
+
 def load() -> dict:
-    """读数据文件。文件不存在、损坏、结构不对，都退回空结构，不让页面崩。"""
+    """读数据。云端模式走登录用户的那一份，本地模式读文件。
+
+    文件不存在、损坏、结构不对，都退回空结构，不让页面崩。
+    云端读失败**不**退回空结构 —— 那会让用户以为数据没了，接着录入新内容把旧的覆盖掉。
+    这种时候直接把异常抛给上层，让页面报错停下。
+    """
+    if _CLOUD_LOAD is not None:
+        data = _CLOUD_LOAD()
+        return _normalize(data) if data else _empty()
+
     path = data_path()
     if not path.exists():
         return _empty()
@@ -265,10 +300,14 @@ def load() -> dict:
     except (OSError, json.JSONDecodeError):
         return _empty()
 
+    return _normalize(data)
+
+
+def _normalize(data) -> dict:
+    """补齐缺失字段。老版本没有 interviews / settings / events，旧文件不用手动改。"""
     if not isinstance(data, dict):
         return _empty()
     data.setdefault("version", SCHEMA_VERSION)
-    # 老版本没有 interviews / settings / events 这几层，这里补齐，旧文件不用手动改
     for key in ("companies", "jobs", "interviews", "events"):
         if not isinstance(data.get(key), list):
             data[key] = []
@@ -278,7 +317,17 @@ def load() -> dict:
 
 
 def save(data: dict, path: Path | None = None) -> tuple[bool, str]:
-    """原子写入，返回 (是否成功, 提示)。path 不传就用当前生效的数据文件。"""
+    """原子写入，返回 (是否成功, 提示)。path 不传就用当前生效的位置。
+
+    云端模式下不传 path → 整份 upsert 到当前登录用户名下；
+    传了 path（迁移、导出备份）→ 仍然写本地文件，这是刻意保留的逃生口。
+    """
+    if _CLOUD_SAVE is not None and path is None:
+        try:
+            return _CLOUD_SAVE(data)
+        except Exception as exc:  # noqa: BLE001 —— 网络异常一律转成界面提示
+            return False, f"云端保存失败：{type(exc).__name__} - {exc}"
+
     path = data_path() if path is None else path
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
