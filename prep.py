@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 
-BUILD = 20261107161500
+BUILD = 20261107213000
 
 # 整行命中这些词、且该行本身不长 → 判定为噪声。长段落不动，避免误删职责描述。
 # 注意：公司简介不是噪声 —— 规模、行业、所在地都能用来判断这岗位值不值得投，
@@ -362,6 +362,7 @@ def parse_interview_log(text: str) -> list[dict]:
         else:
             cur["better"] = (cur["better"] + "\n" + line).strip()
 
-    # 首尾装饰残留（如转写工具写的孤零零「Q1 ✅」）不是真问题，滤掉
-    junk = re.compile(r"[QqＱ]\s*\d{0,2}\s*[\s✅✨☑✔]*")
-    return [x for x in items if x["q"].strip() and not junk.fullmatch(x["q"])]
+    # 首尾装饰残留（如转写工具写的孤零零「Q1 ✅」「###」）不是真问题，滤掉。
+    # 判据：把装饰字符全剥掉后一个正文字符都不剩的标题，就是装饰。
+    _deco = re.compile(r"[\sQqＱ0-9#＃*＊✅✨☑✔✳❗❓\.。、,:：;；\-—–=_【】\[\]（）()]+")
+    return [x for x in items if x["q"].strip() and _deco.sub("", x["q"])]
